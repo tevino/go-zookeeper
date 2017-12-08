@@ -102,6 +102,9 @@ type Conn struct {
 
 	// Debug (used by unit tests)
 	reconnectDelay time.Duration
+	// Debug (used by recurring re-auth hang)
+	debugCloseRecvLoop bool
+	debugReauthDone    chan struct{}
 
 	logger Logger
 
@@ -422,6 +425,9 @@ func (c *Conn) loop() {
 			wg.Add(1)
 			go func() {
 				<-reauthChan
+				if c.debugCloseRecvLoop {
+					close(c.debugReauthDone)
+				}
 				err := c.sendLoop()
 				c.logger.Printf("Send loop terminated: err=%v", err)
 				c.conn.Close() // causes recv loop to EOF/exit
@@ -430,7 +436,12 @@ func (c *Conn) loop() {
 
 			wg.Add(1)
 			go func() {
-				err := c.recvLoop(c.conn)
+				var err error
+				if c.debugCloseRecvLoop {
+					err = errors.New("DEBUG: CLOSE RECV LOOP")
+				} else {
+					err = c.recvLoop(c.conn)
+				}
 				c.logger.Printf("Recv loop terminated: err=%v", err)
 				if err == nil {
 					panic("zk: recvLoop should never return nil error")
