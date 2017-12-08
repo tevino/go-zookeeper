@@ -341,6 +341,17 @@ func (c *Conn) connect() error {
 	}
 }
 
+func (c *Conn) isRecvClosed() bool {
+	select {
+	case <-c.closeChan:
+		return true
+	case <-c.shouldQuit:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 	c.credsMu.Lock()
 	defer c.credsMu.Unlock()
@@ -351,6 +362,10 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 		len(c.creds))
 
 	for _, cred := range c.creds {
+		if c.isRecvClosed() {
+			c.logger.Printf("Recv closed, cancel re-submitting credentials")
+			return
+		}
 		resChan, err := c.sendRequest(
 			opSetAuth,
 			&setAuthRequest{Type: 0,
@@ -366,7 +381,16 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 			continue
 		}
 
-		res := <-resChan
+		var res response
+		select {
+		case res = <-resChan:
+		case <-c.closeChan:
+			c.logger.Printf("Recv closed, cancel re-submitting credentials")
+			return
+		case <-c.shouldQuit:
+			c.logger.Printf("Should quit, cancel re-submitting credentials")
+			return
+		}
 		if res.err != nil {
 			c.logger.Printf("Credential re-submit failed: %s", res.err)
 			// FIXME(prozlach): lets ignore errors for now
