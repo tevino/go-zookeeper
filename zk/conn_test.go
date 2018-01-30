@@ -20,7 +20,7 @@ func TestRecurringReAuthHang(t *testing.T) {
 		}
 	}()
 
-	zkC, err := StartTestCluster(2, ioutil.Discard, ioutil.Discard)
+	zkC, err := StartTestCluster(3, ioutil.Discard, ioutil.Discard)
 	if err != nil {
 		panic(err)
 	}
@@ -30,7 +30,7 @@ func TestRecurringReAuthHang(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	for conn.state != StateHasSession {
+	for conn.State() != StateHasSession {
 		time.Sleep(50 * time.Millisecond)
 	}
 
@@ -40,16 +40,18 @@ func TestRecurringReAuthHang(t *testing.T) {
 	}()
 
 	// Add auth.
+	conn.credsMu.Lock()
 	conn.creds = append(conn.creds, authCreds{"digest", []byte("test:test")})
+	conn.credsMu.Unlock()
 
-	currentServer := conn.server
-	conn.debugCloseRecvLoop = true
-	conn.debugReauthDone = make(chan struct{})
+	currentServer := conn.Server()
+	conn.setDebugCloseRecvLoop(true)
 	zkC.StopServer(currentServer)
 	// wait connect to new zookeeper.
-	for conn.server == currentServer && conn.state != StateHasSession {
+	for conn.Server() == currentServer && conn.State() != StateHasSession {
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	<-conn.debugReauthDone
+	conn.Close()
 }
