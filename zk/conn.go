@@ -102,7 +102,10 @@ type Conn struct {
 	setWatchLimit    int
 	setWatchCallback func([]*setWatchesRequest)
 
-	// Debug (for recurring re-auth hang)
+	// Debug (for recurring re-auth hang) test
+	// These variables shouldn't be used or modified as part of normal
+	// operation.
+	// See `TestRecurringReAuthHang`
 	debugCloseRecvLoop int32
 	debugReauthDone    chan struct{}
 
@@ -432,7 +435,7 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 
 	for _, cred := range c.creds {
 		if shouldCancel() {
-			c.logger.Printf("Cancel rer-submitting credentials")
+			c.logger.Printf("Cancel re-submitting credentials")
 			return
 		}
 		resChan, err := c.sendRequest(
@@ -522,10 +525,15 @@ func (c *Conn) loop() {
 				<-reauthChan
 				// This condition exists for signaling purposes, that the test
 				// `TestRecurringReAuthHang` was successful. The previous call
-				// `<-reauthChan` was not blocking. That means the
+				// `<-reauthChan` did not block. That means the
 				// `resendZkAuth` didn't block even on read loop error.
 				// See `TestRecurringReAuthHang`
 				if c.shouldDebugCloseRecvLoop() {
+					// It is possible that during the test the ZK conn will try
+					// to reconnect multiple times before cleanly closing the
+					// test. This select here is to prevent closing
+					// `c.debugReauthDone` channel twice during the test and
+					// panic.
 					select {
 					case <-c.debugReauthDone:
 					default:
