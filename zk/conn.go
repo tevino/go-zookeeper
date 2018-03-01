@@ -447,7 +447,9 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 
 	for _, cred := range c.creds {
 		if shouldCancel() {
-			c.logger.Printf("Cancel re-submitting credentials")
+			if c.logInfo {
+				c.logger.Printf("Cancel re-submitting credentials")
+			}
 			return
 		}
 		resChan, err := c.sendRequest(
@@ -469,10 +471,14 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 		select {
 		case res = <-resChan:
 		case <-c.closeChan:
-			c.logger.Printf("Recv closed, cancel re-submitting credentials, cannot read")
+			if c.logInfo {
+				c.logger.Printf("Recv closed, cancel re-submitting credentials, cannot read")
+			}
 			return
 		case <-c.shouldQuit:
-			c.logger.Printf("Should quit, cancel re-submitting credentials")
+			if c.logInfo {
+				c.logger.Printf("Should quit, cancel re-submitting credentials")
+			}
 			return
 		}
 		if res.err != nil {
