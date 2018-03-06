@@ -38,10 +38,22 @@ func TestBasicCluster(t *testing.T) {
 	if _, err := zk1.Create("/gozk-test", []byte("foo-cluster"), 0, WorldACL(PermAll)); err != nil {
 		t.Fatalf("Create failed on node 1: %+v", err)
 	}
-	if by, _, err := zk2.Get("/gozk-test"); err != nil {
-		t.Fatalf("Get failed on node 2: %+v", err)
-	} else if string(by) != "foo-cluster" {
-		t.Fatal("Wrong data for node 2")
+
+	deadline := time.Now().Add(time.Duration(zk1.sessionTimeoutMs) * time.Millisecond)
+	for time.Now().Before(deadline) {
+		by, _, err := zk2.Get("/gozk-test")
+		if err == ErrNoNode {
+			time.Sleep(100 * time.Millisecond)
+			t.Logf("Get failed on node 2, retry after 100ms: %+v", err)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("Get failed on node 2: %+v", err)
+		}
+		if string(by) != "foo-cluster" {
+			t.Fatal("Wrong data for node 2")
+		}
+		break
 	}
 }
 
