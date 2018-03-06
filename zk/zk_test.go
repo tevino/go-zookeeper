@@ -6,7 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -88,6 +93,37 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+func TestOpsAfterCloseDontDeadlock(t *testing.T) {
+	ts, err := StartTestCluster(1, nil, logWriter{t: t, p: "[ZKERR] "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Stop()
+	zk, _, err := ts.ConnectAll()
+	if err != nil {
+		t.Fatalf("Connect returned error: %+v", err)
+	}
+	zk.Close()
+
+	path := "/gozk-test"
+
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		for range make([]struct{}, 30) {
+			if _, err := zk.Create(path, []byte{1, 2, 3, 4}, 0, WorldACL(PermAll)); err == nil {
+				t.Fatal("Create did not return error")
+			}
+		}
+	}()
+	select {
+	case <-ch:
+		// expected
+	case <-time.After(10 * time.Second):
+		t.Fatal("ZK connection deadlocked when executing ops after a Close operation")
+	}
+}
+
 func TestMulti(t *testing.T) {
 	ts, err := StartTestCluster(1, nil, logWriter{t: t, p: "[ZKERR] "})
 	if err != nil {
@@ -134,6 +170,7 @@ func TestIfAuthdataSurvivesReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ts.Stop()
 
 	zk, _, err := ts.ConnectAll()
 	if err != nil {
@@ -464,7 +501,12 @@ func TestSetWatchers(t *testing.T) {
 	}
 	defer zk.Close()
 
-	zk.reconnectDelay = time.Second
+	zk.reconnectLatch = make(chan struct{})
+	zk.setWatchLimit = 1024 // break up set-watch step into 1k requests
+	var setWatchReqs atomic.Value
+	zk.setWatchCallback = func(reqs []*setWatchesRequest) {
+		setWatchReqs.Store(reqs)
+	}
 
 	zk2, _, err := ts.ConnectAll()
 	if err != nil {
@@ -476,14 +518,27 @@ func TestSetWatchers(t *testing.T) {
 		t.Fatalf("Delete returned error: %+v", err)
 	}
 
-	testPath, err := zk.Create("/gozk-test-2", []byte{}, 0, WorldACL(PermAll))
-	if err != nil {
-		t.Fatalf("Create returned: %+v", err)
-	}
+	testPaths := map[string]*Watcher{}
+	defer func() {
+		// clean up all of the test paths we create
+		for p := range testPaths {
+			zk2.Delete(p, -1)
+		}
+	}()
 
-	_, _, testW, err := zk.GetW(testPath)
-	if err != nil {
-		t.Fatalf("GetW returned: %+v", err)
+	// we create lots of paths to watch, to make sure a "set watches" request
+	// on re-create will be too big and be required to span multiple packets
+	for i := 0; i < 1000; i++ {
+		testPath, err := zk.Create(fmt.Sprintf("/gozk-test-%d", i), []byte{}, 0, WorldACL(PermAll))
+		if err != nil {
+			t.Fatalf("Create returned: %+v", err)
+		}
+		testPaths[testPath] = nil
+		_, _, testW, err := zk.GetW(testPath)
+		if err != nil {
+			t.Fatalf("GetW returned: %+v", err)
+		}
+		testPaths[testPath] = testW
 	}
 
 	children, stat, childW, err := zk.ChildrenW("/")
@@ -497,28 +552,48 @@ func TestSetWatchers(t *testing.T) {
 
 	// Simulate network error by brutally closing the network connection.
 	zk.conn.Close()
-	if err := zk2.Delete(testPath, -1); err != nil && err != ErrNoNode {
-		t.Fatalf("Delete returned error: %+v", err)
+	for p := range testPaths {
+		if err := zk2.Delete(p, -1); err != nil && err != ErrNoNode {
+			t.Fatalf("Delete returned error: %+v", err)
+		}
 	}
-	// Allow some time for the `zk` session to reconnect and set watches.
-	time.Sleep(time.Millisecond * 100)
-
 	if path, err := zk2.Create("/gozk-test", []byte{1, 2, 3, 4}, 0, WorldACL(PermAll)); err != nil {
 		t.Fatalf("Create returned error: %+v", err)
 	} else if path != "/gozk-test" {
 		t.Fatalf("Create returned different path '%s' != '/gozk-test'", path)
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
+	// zk should still be waiting to reconnect, so none of the watches should have been triggered
+	for p, w := range testPaths {
+		select {
+		case <-w.EvtCh:
+			t.Fatalf("GetW watcher for %q should not have triggered yet", p)
+		default:
+		}
+	}
 	select {
-	case ev := <-testW.EvtCh:
-		if ev.Err != nil {
-			t.Fatalf("GetW watcher error %+v", ev.Err)
+	case <-childW.EvtCh:
+		t.Fatalf("ChildrenW watcher should not have triggered yet")
+	default:
+	}
+
+	// now we let the reconnect occur and make sure it resets watches
+	close(zk.reconnectLatch)
+
+	for p, w := range testPaths {
+		select {
+		case ev := <-w.EvtCh:
+			if ev.Err != nil {
+				t.Fatalf("GetW watcher error %+v", ev.Err)
+			}
+			if ev.Path != p {
+				t.Fatalf("GetW watcher wrong path %s instead of %s", ev.Path, p)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("GetW watcher timed out")
 		}
-		if ev.Path != testPath {
-			t.Fatalf("GetW watcher wrong path %s instead of %s", ev.Path, testPath)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("GetW watcher timed out")
 	}
 
 	select {
@@ -531,6 +606,29 @@ func TestSetWatchers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Child watcher timed out")
+	}
+
+	// Yay! All watches fired correctly. Now we also inspect the actual set-watch request objects
+	// to ensure they didn't exceed the expected packet set.
+	buf := make([]byte, bufferSize)
+	totalWatches := 0
+	actualReqs := setWatchReqs.Load().([]*setWatchesRequest)
+	if len(actualReqs) < 12 {
+		// sanity check: we should have generated *at least* 12 requests to reset watches
+		t.Fatalf("too few setWatchesRequest messages: %d", len(actualReqs))
+	}
+	for _, r := range actualReqs {
+		totalWatches += len(r.ChildWatches) + len(r.DataWatches) + len(r.ExistWatches)
+		n, err := encodePacket(buf, r)
+		if err != nil {
+			t.Fatalf("encodePacket failed: %v! request:\n%+v", err, r)
+		} else if n > 1024 {
+			t.Fatalf("setWatchesRequest exceeded allowed size (%d > 1024)! request:\n%+v", n, r)
+		}
+	}
+
+	if totalWatches != len(testPaths)+1 {
+		t.Fatalf("setWatchesRequests did not include all expected watches; expecting %d, got %d", len(testPaths)+1, totalWatches)
 	}
 }
 
@@ -598,6 +696,16 @@ func TestRequestFail(t *testing.T) {
 	case <-time.After(time.Second * 2):
 		t.Fatal("Get hung when connection could not be made")
 	}
+}
+
+func TestIdempotentClose(t *testing.T) {
+	zk, _, err := Connect([]string{"127.0.0.1:32444"}, time.Second*15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// multiple calls to Close() should not panic
+	zk.Close()
+	zk.Close()
 }
 
 func TestSlowServer(t *testing.T) {
@@ -715,4 +823,159 @@ func startSlowProxy(t *testing.T, up, down Rate, upstream string, adj func(ln *L
 		}
 	}()
 	return ln.Addr().String(), stopCh, nil
+}
+
+func TestMaxBufferSize(t *testing.T) {
+	ts, err := StartTestCluster(1, nil, logWriter{t: t, p: "[ZKERR] "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Stop()
+	// no buffer size
+	zk, _, err := ts.ConnectWithOptions(15 * time.Second)
+	var l testLogger
+	if err != nil {
+		t.Fatalf("Connect returned error: %+v", err)
+	}
+	defer zk.Close()
+	// 1k buffer size, logs to custom test logger
+	zkLimited, _, err := ts.ConnectWithOptions(15*time.Second, WithMaxBufferSize(1024), func(conn *Conn) {
+		conn.SetLogger(&l)
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %+v", err)
+	}
+	defer zkLimited.Close()
+
+	// With small node with small number of children
+	data := []byte{101, 102, 103, 103}
+	_, err = zk.Create("/foo", data, 0, WorldACL(PermAll))
+	if err != nil {
+		t.Fatalf("Create returned error: %+v", err)
+	}
+	var children []string
+	for i := 0; i < 4; i++ {
+		childName, err := zk.Create("/foo/child", nil, FlagEphemeral|FlagSequence, WorldACL(PermAll))
+		if err != nil {
+			t.Fatalf("Create returned error: %+v", err)
+		}
+		children = append(children, childName[len("/foo/"):]) // strip parent prefix from name
+	}
+	sort.Strings(children)
+
+	// Limited client works fine
+	resultData, _, err := zkLimited.Get("/foo")
+	if err != nil {
+		t.Fatalf("Get returned error: %+v", err)
+	}
+	if !reflect.DeepEqual(resultData, data) {
+		t.Fatalf("Get returned unexpected data; expecting %+v, got %+v", data, resultData)
+	}
+	resultChildren, _, err := zkLimited.Children("/foo")
+	if err != nil {
+		t.Fatalf("Children returned error: %+v", err)
+	}
+	sort.Strings(resultChildren)
+	if !reflect.DeepEqual(resultChildren, children) {
+		t.Fatalf("Children returned unexpected names; expecting %+v, got %+v", children, resultChildren)
+	}
+
+	// With large node though...
+	data = make([]byte, 1024)
+	for i := 0; i < 1024; i++ {
+		data[i] = byte(i)
+	}
+	_, err = zk.Create("/bar", data, 0, WorldACL(PermAll))
+	if err != nil {
+		t.Fatalf("Create returned error: %+v", err)
+	}
+	_, _, err = zkLimited.Get("/bar")
+	// NB: Sadly, without actually de-serializing the too-large response packet, we can't send the
+	// right error to the corresponding outstanding request. So the request just sees ErrConnectionClosed
+	// while the log will see the actual reason the connection was closed.
+	expectErr(t, err, ErrConnectionClosed)
+	expectLogMessage(t, &l, "received packet from server with length .*, which exceeds max buffer size 1024")
+
+	// Or with large number of children...
+	totalLen := 0
+	children = nil
+	for totalLen < 1024 {
+		childName, err := zk.Create("/bar/child", nil, FlagEphemeral|FlagSequence, WorldACL(PermAll))
+		if err != nil {
+			t.Fatalf("Create returned error: %+v", err)
+		}
+		n := childName[len("/bar/"):] // strip parent prefix from name
+		children = append(children, n)
+		totalLen += len(n)
+	}
+	sort.Strings(children)
+	_, _, err = zkLimited.Children("/bar")
+	expectErr(t, err, ErrConnectionClosed)
+	expectLogMessage(t, &l, "received packet from server with length .*, which exceeds max buffer size 1024")
+
+	// Other client (without buffer size limit) can successfully query the node and its children, of course
+	resultData, _, err = zk.Get("/bar")
+	if err != nil {
+		t.Fatalf("Get returned error: %+v", err)
+	}
+	if !reflect.DeepEqual(resultData, data) {
+		t.Fatalf("Get returned unexpected data; expecting %+v, got %+v", data, resultData)
+	}
+	resultChildren, _, err = zk.Children("/bar")
+	if err != nil {
+		t.Fatalf("Children returned error: %+v", err)
+	}
+	sort.Strings(resultChildren)
+	if !reflect.DeepEqual(resultChildren, children) {
+		t.Fatalf("Children returned unexpected names; expecting %+v, got %+v", children, resultChildren)
+	}
+}
+
+func expectErr(t *testing.T, err error, expected error) {
+	if err == nil {
+		t.Fatalf("Get for node that is too large should have returned error!")
+	}
+	if err != expected {
+		t.Fatalf("Get returned wrong error; expecting ErrClosing, got %+v", err)
+	}
+}
+
+func expectLogMessage(t *testing.T, logger *testLogger, pattern string) {
+	re := regexp.MustCompile(pattern)
+	events := logger.Reset()
+	if len(events) == 0 {
+		t.Fatalf("Failed to log error; expecting message that matches pattern: %s", pattern)
+	}
+	var found []string
+	for _, e := range events {
+		if re.Match([]byte(e)) {
+			found = append(found, e)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("Failed to log error; expecting message that matches pattern: %s", pattern)
+	} else if len(found) > 1 {
+		t.Fatalf("Logged error redundantly %d times:\n%+v", len(found), found)
+	}
+}
+
+type testLogger struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (l *testLogger) Printf(msgFormat string, args ...interface{}) {
+	msg := fmt.Sprintf(msgFormat, args...)
+	fmt.Println(msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, msg)
+}
+
+func (l *testLogger) Reset() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ret := l.events
+	l.events = nil
+	return ret
 }
